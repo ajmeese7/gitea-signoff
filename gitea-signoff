@@ -1,0 +1,200 @@
+#!/usr/bin/env bash
+# gitea-signoff: sign off on your own work by writing a commit status to Gitea.
+# A Gitea port of Basecamp's gh-signoff (https://github.com/basecamp/gh-signoff).
+# We wrote this from scratch; the idea is theirs. Credit in the README.
+set -euo pipefail
+
+VERSION=0.1.0
+
+# Symbols for commit-status states.
+readonly SYM_SUCCESS=$'✓'  # ✓
+readonly SYM_PENDING=$'⟳'  # ⟳
+readonly SYM_FAILURE=$'✗'  # ✗
+
+# Optional login override for `tea api` (user may run several Gitea instances).
+LOGIN="${GITEA_SIGNOFF_LOGIN:-}"
+
+die() { echo "gitea-signoff: $*" >&2; exit 1; }
+
+# --- pure helpers (unit-tested by test.sh) -----------------------------------
+
+# resolve_context [name] -> "signoff" or "signoff/<name>"
+resolve_context() {
+  local name="${1:-}"
+  if [ -n "$name" ]; then echo "signoff/$name"; else echo "signoff"; fi
+}
+
+# state_symbol <state> -> a status glyph
+state_symbol() {
+  case "$1" in
+    success) echo "$SYM_SUCCESS" ;;
+    pending) echo "$SYM_PENDING" ;;
+    *)       echo "$SYM_FAILURE" ;;  # error, failure, warning, missing
+  esac
+}
+
+# is_signoff_context <context> -> exit 0 if it's a signoff context
+is_signoff_context() {
+  case "$1" in signoff|signoff/*) return 0 ;; *) return 1 ;; esac
+}
+
+# --- tea/git plumbing --------------------------------------------------------
+
+api() {
+  # Thin wrapper so the login override is applied uniformly.
+  if [ -n "$LOGIN" ]; then tea api -l "$LOGIN" "$@"; else tea api "$@"; fi
+}
+
+require_tools() {
+  command -v tea >/dev/null || die "tea (Gitea CLI) is required: https://gitea.com/gitea/tea"
+  command -v jq  >/dev/null || die "jq is required"
+  git rev-parse --git-dir >/dev/null 2>&1 || die "not a git repository"
+}
+
+default_branch() {
+  api "/repos/{owner}/{repo}" | jq -r '.default_branch'
+}
+
+# Signer name for the status description, best-effort.
+signer() {
+  tea whoami 2>/dev/null | tr -d '[:space:]' || true
+}
+
+# Fail unless the working tree is clean and HEAD is pushed to its upstream.
+assert_publishable() {
+  [ -z "$(git status --porcelain)" ] || die "uncommitted changes; commit or pass -f"
+  local up
+  up="$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null)" \
+    || die "no upstream for this branch; push it or pass -f"
+  [ -z "$(git rev-list '@{u}'..HEAD)" ] \
+    || die "unpushed commits; push them or pass -f"
+}
+
+# required_signoff_contexts <branch> -> signoff* contexts required on that branch
+required_signoff_contexts() {
+  api "/repos/{owner}/{repo}/branch_protections/$1" 2>/dev/null \
+    | jq -r '.status_check_contexts[]? | select(startswith("signoff"))' 2>/dev/null || true
+}
+
+# --- subcommands -------------------------------------------------------------
+
+cmd_create() {
+  local force=false
+  while [ "${1:-}" = "-f" ]; do force=true; shift; done
+  local context sha desc
+  context="$(resolve_context "${1:-}")"
+  $force || assert_publishable
+  sha="$(git rev-parse HEAD)"
+  desc="Signed off"
+  local who; who="$(signer)"; [ -n "$who" ] && desc="Signed off by $who"
+  api -X POST "/repos/{owner}/{repo}/statuses/$sha" \
+    -d "$(jq -n --arg s "$context" --arg d "$desc" \
+             '{state:"success", context:$s, description:$d}')" >/dev/null
+  echo "$SYM_SUCCESS $context on ${sha:0:8}"
+}
+
+cmd_install() {
+  local branch context existing merged
+  branch="${1:-$(default_branch)}"
+  context="$(resolve_context "${2:-}")"
+  existing="$(api "/repos/{owner}/{repo}/branch_protections/$branch" 2>/dev/null || true)"
+  if [ -z "$existing" ] || [ "$(jq -r 'has("branch_name") // false' <<<"$existing" 2>/dev/null)" != "true" ]; then
+    # No rule yet: create one requiring the signoff status.
+    api -X POST "/repos/{owner}/{repo}/branch_protections" \
+      -d "$(jq -n --arg b "$branch" --arg c "$context" \
+               '{rule_name:$b, branch_name:$b, enable_status_check:true, status_check_contexts:[$c]}')" >/dev/null
+  else
+    # Merge into the existing rule without clobbering other required checks.
+    merged="$(jq -c --arg c "$context" \
+      '((.status_check_contexts // []) + [$c] | unique)' <<<"$existing")"
+    api -X PATCH "/repos/{owner}/{repo}/branch_protections/$branch" \
+      -d "$(jq -n --argjson ctx "$merged" \
+               '{enable_status_check:true, status_check_contexts:$ctx}')" >/dev/null
+  fi
+  echo "$SYM_SUCCESS require $context on $branch"
+}
+
+cmd_uninstall() {
+  local branch context existing remaining
+  branch="${1:-$(default_branch)}"
+  context="$(resolve_context "${2:-}")"
+  existing="$(api "/repos/{owner}/{repo}/branch_protections/$branch" 2>/dev/null || true)"
+  [ -n "$existing" ] || { echo "no protection on $branch"; return 0; }
+  remaining="$(jq -c --arg c "$context" \
+    '((.status_check_contexts // []) - [$c])' <<<"$existing")"
+  api -X PATCH "/repos/{owner}/{repo}/branch_protections/$branch" \
+    -d "$(jq -n --argjson ctx "$remaining" \
+             '{enable_status_check: ($ctx | length > 0), status_check_contexts:$ctx}')" >/dev/null
+  echo "$SYM_SUCCESS no longer require $context on $branch"
+}
+
+cmd_check() {
+  local branch; branch="${1:-$(default_branch)}"
+  if [ -n "$(required_signoff_contexts "$branch")" ]; then
+    echo "$SYM_SUCCESS signoff required on $branch"
+  else
+    echo "$SYM_FAILURE signoff not required on $branch"
+    return 1
+  fi
+}
+
+cmd_status() {
+  local branch sha statuses ctx required state
+  branch="${1:-$(default_branch)}"
+  sha="$(git rev-parse HEAD)"
+  statuses="$(api "/repos/{owner}/{repo}/commits/$sha/status" 2>/dev/null || echo '{}')"
+  required="$(required_signoff_contexts "$branch")"
+  [ -n "$required" ] || { echo "no signoff required on $branch"; return 0; }
+  local rc=0
+  while IFS= read -r ctx; do
+    [ -n "$ctx" ] || continue
+    state="$(jq -r --arg c "$ctx" \
+      'first(.statuses[]? | select(.context==$c) | .status) // "pending"' <<<"$statuses")"
+    [ "$state" = "success" ] || rc=1
+    echo "$(state_symbol "$state") $ctx"
+  done <<<"$required"
+  return $rc
+}
+
+usage() {
+  cat <<EOF
+gitea-signoff $VERSION - sign off on your own work (Gitea commit statuses)
+
+Usage:
+  gitea-signoff [-f] [context]        Sign off the current commit (context -> signoff/<context>)
+  gitea-signoff install [branch] [context]    Require the signoff status on a branch
+  gitea-signoff uninstall [branch] [context]  Stop requiring it
+  gitea-signoff check [branch]        Is signoff required on the branch?
+  gitea-signoff status [branch]       Show signoff status of the current commit
+  gitea-signoff version
+
+Options:
+  -f                Sign off even with uncommitted/unpushed changes
+  --login, -l NAME  Use a specific Gitea login (default: from repo remote)
+
+Auth and host come from tea; run 'tea login add' first.
+EOF
+}
+
+main() {
+  require_tools
+  # Global --login/-l before the subcommand.
+  while [ "${1:-}" = "--login" ] || [ "${1:-}" = "-l" ]; do
+    LOGIN="${2:?--login needs a value}"; shift 2
+  done
+  local cmd="${1:-}"; [ $# -gt 0 ] && shift || true
+  case "$cmd" in
+    ""|create)          cmd_create "$@" ;;
+    install)            cmd_install "$@" ;;
+    uninstall)          cmd_uninstall "$@" ;;
+    check)              cmd_check "$@" ;;
+    status)             cmd_status "$@" ;;
+    version|--version)  echo "gitea-signoff $VERSION" ;;
+    help|-h|--help)     usage ;;
+    -f)                 cmd_create -f "$@" ;;
+    *)                  cmd_create "$cmd" "$@" ;;  # bare context name
+  esac
+}
+
+# Run main only when executed, not when sourced by test.sh.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then main "$@"; fi
