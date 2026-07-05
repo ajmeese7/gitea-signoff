@@ -56,8 +56,10 @@ default_branch() {
 }
 
 # Signer name for the status description, best-effort.
+# `tea whoami` renders a decorated card (ANSI hyperlinks, follower counts), so
+# ask the API for the plain login instead; honours the same login override.
 signer() {
-  tea whoami 2>/dev/null | tr -d '[:space:]' || true
+  api /user 2>/dev/null | jq -r '.login // empty' 2>/dev/null || true
 }
 
 # Fail unless the working tree is clean and HEAD is pushed to its upstream.
