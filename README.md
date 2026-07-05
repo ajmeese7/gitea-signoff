@@ -20,13 +20,13 @@ This is an independent, from-scratch port of Basecamp's [`gh-signoff`](https://g
 
 Drop the script on your `PATH`:
 
-```
+```sh
 install -m 0755 gitea-signoff ~/.local/bin/gitea-signoff
 ```
 
 ## Usage
 
-```
+```sh
 gitea-signoff                       # sign off the current commit (context: signoff)
 gitea-signoff frontend              # sign off with context signoff/frontend
 gitea-signoff -f                    # sign off even with a dirty/unpushed tree
@@ -45,7 +45,7 @@ By default signing off refuses to run with uncommitted or unpushed changes, so t
 
 Host and login are discovered from the repo's remote. To force a specific `tea` login:
 
-```
+```sh
 gitea-signoff --login work install
 # or
 GITEA_SIGNOFF_LOGIN=work gitea-signoff status
@@ -59,7 +59,7 @@ GITEA_SIGNOFF_LOGIN=work gitea-signoff status
 
 ## Tests
 
-```
+```sh
 ./test.sh
 ```
 
