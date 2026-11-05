@@ -19,8 +19,19 @@ check "pending symbol"         "$SYM_PENDING"     "$(state_symbol pending)"
 check "failure symbol"         "$SYM_FAILURE"     "$(state_symbol failure)"
 check "unknown symbol"         "$SYM_FAILURE"     "$(state_symbol nonsense)"
 
-is_signoff_context signoff          && check "signoff is signoff"      yes yes || check "signoff is signoff" yes no
-is_signoff_context signoff/web      && check "signoff/web is signoff"  yes yes || check "signoff/web is signoff" yes no
-is_signoff_context lint             && check "lint is not signoff"     yes no  || check "lint is not signoff" yes yes
+for context in signoff signoff/web; do
+  if is_signoff_context "$context"; then
+    check "$context is signoff" yes yes
+  else
+    check "$context is signoff" yes no
+  fi
+done
+for context in lint signoff-backup signoffXYZ; do
+  if is_signoff_context "$context"; then
+    check "$context is not signoff" no yes
+  else
+    check "$context is not signoff" no no
+  fi
+done
 
 exit $fail
