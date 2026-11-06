@@ -1,66 +1,85 @@
 # gitea-signoff
 
-Local CI. Sign off on your own work.
+Local CI and human signoff for Gitea. Publish a commit status, and optionally require it before merging.
 
-CI is slow. Sometimes you just want a human to vouch for a commit. `gitea-signoff` writes a `signoff` commit status to Gitea, and (optionally) makes that status a required check on a branch. You become the CI.
-
-It is a single bash script that shells out to [`tea`](https://gitea.com/gitea/tea) for authenticated API calls, so auth and host resolution come from your existing `tea login`. No tokens to wrangle.
-
-## Credit
-
-This is an independent, from-scratch port of Basecamp's [`gh-signoff`](https://github.com/basecamp/gh-signoff) (for GitHub). The idea is theirs; none of their code was used. Go read their write-up, it explains the "why" better than this README will.
+A single Bash script using [`gt`](https://gitea.com/gitea/cli) for authenticated API calls and repository discovery. No tokens to wrangle.
 
 ## Requirements
 
-- [`tea`](https://gitea.com/gitea/tea) (Gitea CLI), logged in: `tea login add`
-- `jq`
-- `git`
+- `gt` 1.1.0 or later, authenticated with `gt auth login`
+- Bash, `jq`, Git
+- Repository write access for statuses; repository administration for protection changes
 
 ## Install
-
-Drop the script on your `PATH`:
 
 ```sh
 install -m 0755 gitea-signoff ~/.local/bin/gitea-signoff
 ```
 
-## Usage
+## Run local checks
+
+Push the branch with an upstream first, then run your project's checks:
 
 ```sh
-gitea-signoff                       # sign off the current commit (context: signoff)
-gitea-signoff frontend              # sign off with context signoff/frontend
-gitea-signoff -f                    # sign off even with a dirty/unpushed tree
-
-gitea-signoff install [branch] [context]     # require the signoff status on a branch
-gitea-signoff uninstall [branch] [context]   # stop requiring it
-gitea-signoff check [branch]        # is signoff required on the branch?
-gitea-signoff status [branch]       # signoff status of the current commit
+gitea-signoff run local-ci -- ./scripts/check-project.sh
 ```
 
-`branch` defaults to the repo's default branch. `context` becomes `signoff/<context>`; omit it for the plain `signoff` context.
+This posts `signoff/local-ci` as pending, runs the command with its original arguments, and publishes success only after exit zero and a second check of the clean working tree, HEAD and live upstream SHA. Failure or interruption records failure on the original SHA. A failed rerun replaces an earlier green result. If Gitea cannot accept the final status, the command fails and reports the error; an interrupted network request can leave a pending status, never an inferred success. Force mode is unavailable for `run`.
 
-By default signing off refuses to run with uncommitted or unpushed changes, so the status attaches to a commit the server actually has. Pass `-f` to override.
+Commands run as child process groups so terminating the signoff process also terminates their ordinary descendants. SIGKILL and host failure cannot run cleanup; pending then remains pending. Local checks must keep generated logs and build output ignored by Git, and must not change tracked inputs. The command owns its log retention; stdout and stderr pass through unchanged.
 
-### Multiple Gitea instances
+A local status is an attestation from the authenticated account, not independent evidence that the checks ran. Keep independent post-merge CI if that distinction matters to your workflow. These statuses are unrelated to Git's `Signed-off-by` trailers or cryptographic commit signing.
 
-Host and login are discovered from the repo's remote. To force a specific `tea` login:
+## Human signoff
 
 ```sh
-gitea-signoff --login work install
-# or
-GITEA_SIGNOFF_LOGIN=work gitea-signoff status
+gitea-signoff                 # signoff on current HEAD
+gitea-signoff frontend        # signoff/frontend
+gitea-signoff -f              # explicitly bypass clean/published checks for human signoff
 ```
+
+Ordinary signoff requires a clean attached branch whose upstream currently points to HEAD, and verifies that SHA exists in the selected Gitea repository. It does not execute checks. Extra positional arguments are rejected so an accidental command cannot silently become a human signoff.
+
+## Require a status
+
+```sh
+gitea-signoff install master local-ci
+gitea-signoff check master
+gitea-signoff status master
+gitea-signoff uninstall master local-ci
+```
+
+Omitting the branch uses the repository default. Omitting the context uses `signoff`. Install/uninstall preserve unrelated required contexts and other protection fields. They do not remove existing runner requirements: coordinate that change separately when disabling PR workflows, or merges will remain blocked waiting for them. API errors fail the command; only an explicit HTTP 404 means no protection rule.
+
+`status` reads the newest status for each required `signoff` / `signoff/*` context, including paginated history. Disabled status protection is not reported as enforced.
+
+## Multiple instances and accounts
+
+Global options precede the command:
+
+```sh
+gitea-signoff --host http://gitea.example:3000 --user alice --repo team/project run local-ci -- ./check.sh
+```
+
+Defaults come from `gt`'s normal repository discovery. `GITEA_SIGNOFF_HOST`, `GITEA_SIGNOFF_USER` and `GITEA_SIGNOFF_REPO` provide equivalent overrides. The resolved repository URL is pinned before issuing status or protection requests.
 
 ## How it works
 
-- **Sign off** → `POST /repos/{owner}/{repo}/statuses/{sha}` with `state: success`, `context: signoff`.
-- **install/uninstall** → merges/removes the context in `/repos/{owner}/{repo}/branch_protections/{branch}` (`enable_status_check`, `status_check_contexts`) without clobbering other required checks.
-- **status/check** → reads the branch protection's required `signoff*` contexts and the commit's combined status.
+- **Human signoff** writes a success commit status for the current commit.
+- **Run local checks** writes pending before executing the command, then success only if it exits successfully and the commit is still clean and published; failures and interruptions write failure.
+- **Install/uninstall** adds or removes a required signoff context while preserving unrelated required contexts and other protection settings.
+- **Check/status** reports whether signoff is required and whether the latest status for each required signoff context succeeded.
 
 ## Tests
 
 ```sh
 ./test.sh
+python3 test_live.py                 # skips unless explicitly configured
+GITEA_SIGNOFF_TEST_HOST=http://gitea.example:3000 python3 test_live.py -v
 ```
 
-Covers the pure logic (context naming, state symbols). The API paths need a live Gitea repo and are exercised manually.
+The live suite requires an authenticated account allowed to create private repositories and SSH Git access to that instance. It creates one uniquely named private repository, tests real pushes, statuses, protections, failed checks, dirty/changed HEAD, stale upstream and process termination, then deletes that repository. No production protection rule is changed. Git fixture commits are unsigned and local to the disposable repository. If setup fails before the cleanup registration, inspect the printed error before running again.
+
+## Credit
+
+An independent, from-scratch port of Basecamp's [`gh-signoff`](https://github.com/basecamp/gh-signoff). The idea is theirs; none of their code was used.
