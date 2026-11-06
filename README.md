@@ -2,13 +2,15 @@
 
 Local CI and human signoff for Gitea. Publish a commit status, and optionally require it before merging.
 
-A single Bash script using [`gt`](https://gitea.com/gitea/cli) for authentication and repository discovery. No token copying. Version 0.2 replaces the former `tea` integration; authenticate with `gt auth login` and use `--host` / `--user` instead of `--login`.
+A single Bash script using [`gt`](https://gitea.com/gitea/cli) for authenticated API calls and repository discovery. No tokens to wrangle.
 
 ## Requirements
 
 - `gt` 1.1.0 or later, authenticated with `gt auth login`
 - Bash, `jq`, Git
 - Repository write access for statuses; repository administration for protection changes
+
+## Install
 
 ```sh
 install -m 0755 gitea-signoff ~/.local/bin/gitea-signoff
@@ -60,6 +62,13 @@ gitea-signoff --host http://gitea.example:3000 --user alice --repo team/project 
 ```
 
 Defaults come from `gt`'s normal repository discovery. `GITEA_SIGNOFF_HOST`, `GITEA_SIGNOFF_USER` and `GITEA_SIGNOFF_REPO` provide equivalent overrides. The resolved repository URL is pinned before issuing status or protection requests.
+
+## How it works
+
+- **Human signoff** writes a success commit status for the current commit.
+- **Run local checks** writes pending before executing the command, then success only if it exits successfully and the commit is still clean and published; failures and interruptions write failure.
+- **Install/uninstall** adds or removes a required signoff context while preserving unrelated required contexts and other protection settings.
+- **Check/status** reports whether signoff is required and whether the latest status for each required signoff context succeeded.
 
 ## Tests
 

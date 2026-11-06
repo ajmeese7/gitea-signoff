@@ -2,15 +2,27 @@
 set -euo pipefail
 
 VERSION=0.2.0
+
+# Symbols used when printing commit-status states.
 readonly SYM_SUCCESS=$'✓'
 readonly SYM_PENDING=$'⟳'
 readonly SYM_FAILURE=$'✗'
+
+# Optional overrides for users working across multiple Gitea instances.
 HOST="${GITEA_SIGNOFF_HOST:-}"
 USER_NAME="${GITEA_SIGNOFF_USER:-}"
 REPO="${GITEA_SIGNOFF_REPO:-}"
 
 die() { echo "gitea-signoff: $*" >&2; exit 1; }
-resolve_context() { if [ -n "${1:-}" ]; then echo "signoff/$1"; else echo signoff; fi; }
+
+# --- pure helpers (unit-tested by test.sh) -----------------------------------
+
+# resolve_context [name] -> "signoff" or "signoff/<name>"
+resolve_context() {
+  local name="${1:-}"
+  if [ -n "$name" ]; then echo "signoff/$name"; else echo signoff; fi
+}
+# state_symbol <state> -> a status glyph
 state_symbol() {
   case "$1" in
     success) echo "$SYM_SUCCESS" ;;
@@ -18,7 +30,13 @@ state_symbol() {
     *) echo "$SYM_FAILURE" ;;
   esac
 }
-is_signoff_context() { case "$1" in signoff|signoff/*) return 0 ;; *) return 1 ;; esac; }
+# is_signoff_context <context> -> exit 0 if it's a signoff context
+is_signoff_context() {
+  case "$1" in signoff|signoff/*) return 0 ;; *) return 1 ;; esac
+}
+
+# --- gt/git plumbing ---------------------------------------------------------
+
 api() {
   local flags=(--no-input)
   [ -z "$HOST" ] || flags+=(--host "$HOST")
@@ -26,21 +44,31 @@ api() {
   [ -z "$REPO" ] || flags+=(--repo "$REPO")
   GITEA_CLI_ERROR_FORMAT=json gt "${flags[@]}" api "$@"
 }
+
 require_tools() {
   command -v gt >/dev/null || die "gt is required: https://gitea.com/gitea/cli"
   command -v jq >/dev/null || die "jq is required"
   git rev-parse --git-dir >/dev/null 2>&1 || die "not a git repository"
 }
+
 pin_repository() {
   REPO="$(api 'repos/{owner}/{repo}' | jq -er '.html_url | strings | select(length > 0)')"
 }
-default_branch() { api 'repos/{owner}/{repo}' | jq -er '.default_branch | strings | select(length > 0)'; }
-branch_path() { jq -nr --arg branch "$1" '$branch | @uri'; }
+
+default_branch() {
+  api 'repos/{owner}/{repo}' | jq -er '.default_branch | strings | select(length > 0)'
+}
+
+branch_path() {
+  jq -nr --arg branch "$1" '$branch | @uri'
+}
+
 protection() {
   local error_file result rc=0
   error_file="$(mktemp)"
   result="$(api "repos/{owner}/{repo}/branch_protections/$(branch_path "$1")" 2>"$error_file")" || rc=$?
   if [ "$rc" -ne 0 ]; then
+    # Only a real not-found response means this branch has no protection rule.
     if jq -e '.error.status == 404' "$error_file" >/dev/null 2>&1; then
       rm -f "$error_file"
       echo null
@@ -53,15 +81,19 @@ protection() {
   rm -f "$error_file"
   jq -e 'select(type == "object" and (.enable_status_check | type == "boolean") and (.status_check_contexts | type == "array") and all(.status_check_contexts[]; type == "string"))' <<<"$result"
 }
+
+# required_signoff_contexts <branch> -> enabled "signoff" and "signoff/*" contexts for the branch
 required_signoff_contexts() {
   protection "$1" | jq -r 'select(. != null and .enable_status_check) | .status_check_contexts[] | select(. == "signoff" or startswith("signoff/"))'
 }
+
 assert_unchanged() {
   local changes
   changes="$(git status --porcelain)" || die "cannot inspect working tree"
   [ "$(git rev-parse HEAD)" = "$1" ] || die "HEAD changed while checking; refusing signoff"
   [ -z "$changes" ] || die "uncommitted changes; commit before signing off"
 }
+
 assert_publishable() {
   local sha="$1" branch remote ref published
   assert_unchanged "$sha"
@@ -69,17 +101,22 @@ assert_publishable() {
   remote="$(git config --get "branch.$branch.remote")" || die "no upstream; push with --set-upstream first"
   ref="$(git config --get "branch.$branch.merge")" || die "no upstream branch"
   [ "$remote" != . ] || die "upstream must be a remote repository"
+  # The configured upstream ref can move after a local tracking ref was fetched.
   published="$(git ls-remote --exit-code "$remote" "$ref")" || die "cannot verify the published branch"
   [ "${published%%$'\t'*}" = "$sha" ] || die "remote branch does not point to HEAD; push first"
   api "repos/{owner}/{repo}/git/commits/$sha" | jq -e --arg sha "$sha" '.sha == $sha' >/dev/null \
     || die "commit is not present in the selected Gitea repository"
   assert_unchanged "$sha"
 }
+
 publish_status() {
   local payload
   payload="$(jq -n --arg c "$2" --arg s "$3" --arg d "$4" '{context:$c, state:$s, description:$d}')"
   printf '%s' "$payload" | api -X POST "repos/{owner}/{repo}/statuses/$1" --input - >/dev/null
 }
+
+# --- subcommands -------------------------------------------------------------
+
 cmd_create() {
   local force=false sha context who
   if [ "${1:-}" = -f ]; then force=true; shift; fi
@@ -112,6 +149,7 @@ cmd_run() {
     fi
     exit "$rc"
   }
+  # Job control gives the command its own process group so signals reach descendants.
   # shellcheck disable=SC2317 # Invoked through signal traps.
   stop() { [ -z "$child" ] || kill -TERM -- "-$child" 2>/dev/null || true; exit "$1"; }
   trap finish EXIT
@@ -198,6 +236,7 @@ Authenticate with gt auth login. Run refuses dirty, detached or unpublished HEAD
 -f applies only to human signoff; it cannot bypass checks in run.
 HELP
 }
+
 main() {
   while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -224,4 +263,6 @@ main() {
     *) cmd_create "$cmd" "$@" ;;
   esac
 }
+
+# Run main only when executed, not when sourced by test.sh.
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then main "$@"; fi
